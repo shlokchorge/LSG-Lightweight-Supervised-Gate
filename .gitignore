@@ -1,0 +1,16 @@
+# Embedding cache (large numpy files, regenerated automatically)
+.emb_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
