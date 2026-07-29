@@ -1,0 +1,9 @@
+metric,value,note
+cosine_within_STORE,0.1654,high baseline sim in MiniLM cone — not diagnostic alone
+cosine_within_IGNORE,0.1465,
+cosine_across_classes,0.1382,
+cosine_separation_ratio,1.1286,">1 means within-class > across-class, but margin is small"
+l2_centroid_distance,0.143,absolute distance between class centroids in 384-d space
+lda_fisher_ratio,0.011543,between-class / within-class scatter; >0 = some linear signal
+linear_probe_accuracy,0.8078,LR trained on test embeddings — upper bound on separability
+zero_shot_auc,,0.583 — barely above chance; consistent with weak separation
