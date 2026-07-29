@@ -1,3 +1,0 @@
-model,precision,recall,f1,roc_auc,auprc,ece
-Baseline (statistical),0.5352,0.9948,0.696,0.4149,0.468,0.2331
-LSG (zero-shot),0.5639,0.7838,0.6559,0.5928,0.6,0.1819
