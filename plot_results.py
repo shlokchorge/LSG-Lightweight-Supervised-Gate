@@ -1,6 +1,7 @@
 import os
 import csv
-import math
+
+DEFAULT_PALETTE = ['#2b5c8f', '#d95f02', '#2ca02c', '#9467bd', '#8c564b', '#e377c2']
 
 def parse_csv(filepath):
     if not os.path.exists(filepath):
@@ -11,25 +12,27 @@ def parse_csv(filepath):
     return data
 
 def generate_svg_pr_curve(pr_data, output_path):
-    # Separate by model
+    # Separate points by model dynamically
     models = {}
     for row in pr_data:
-        m = row['model']
+        m = row.get('model', 'Unknown')
         if m not in models:
             models[m] = []
         try:
             r = float(row['recall'])
             p = float(row['precision'])
             models[m].append((r, p))
-        except ValueError:
+        except (ValueError, KeyError):
             continue
+
+    if not models:
+        print(f"Warning: No valid numeric data points found in PR sweep CSV for '{output_path}'")
+        return
 
     width, height = 600, 450
     padding = 60
     plot_w = width - 2 * padding
     plot_h = height - 2 * padding
-
-    colors = {'LSG': '#2b5c8f', 'Baseline': '#d95f02'}
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" style="background-color:#ffffff; font-family:sans-serif;">']
     svg.append(f'<text x="{width/2}" y="30" text-anchor="middle" font-size="16" font-weight="bold">Precision-Recall Curve</text>')
@@ -53,14 +56,13 @@ def generate_svg_pr_curve(pr_data, output_path):
     svg.append(f'<text x="{width/2}" y="{height - 15}" text-anchor="middle" font-size="13">Recall</text>')
     svg.append(f'<text x="15" y="{height/2}" text-anchor="middle" font-size="13" transform="rotate(-90 15 {height/2})">Precision</text>')
 
-    # Plots
+    # Dynamic plots and legend
     color_idx = 0
-    palette = ['#2b5c8f', '#d95f02', '#2ca02c', '#9467bd']
     legend_y = y1 + 20
 
     for m_name, points in models.items():
         points.sort(key=lambda item: item[0])
-        c = colors.get(m_name, palette[color_idx % len(palette)])
+        c = DEFAULT_PALETTE[color_idx % len(DEFAULT_PALETTE)]
         color_idx += 1
         
         path_data = []
@@ -80,7 +82,20 @@ def generate_svg_pr_curve(pr_data, output_path):
         f.write('\n'.join(svg))
 
 def generate_svg_latency(lat_data, output_path):
-    if not lat_data:
+    x_vals = []
+    lsg_vals = []
+    base_vals = []
+
+    for r in lat_data:
+        try:
+            x_vals.append(float(r['memory_size']))
+            lsg_vals.append(float(r['lsg_latency_ms']))
+            base_vals.append(float(r['baseline_latency_ms']))
+        except (ValueError, KeyError):
+            continue
+
+    if not x_vals:
+        print(f"Warning: No valid numeric latency data rows found in CSV for '{output_path}'")
         return
     
     width, height = 600, 450
@@ -88,12 +103,8 @@ def generate_svg_latency(lat_data, output_path):
     plot_w = width - 2 * padding
     plot_h = height - 2 * padding
 
-    x_vals = [float(r['memory_size']) for r in lat_data]
-    lsg_vals = [float(r['lsg_latency_ms']) for r in lat_data]
-    base_vals = [float(r['baseline_latency_ms']) for r in lat_data]
-
-    max_x = max(x_vals)
-    max_y = max(base_vals) * 1.1
+    max_x = max(x_vals) if max(x_vals) > 0 else 1.0
+    max_y = max(base_vals) * 1.1 if max(base_vals) > 0 else 1.0
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" style="background-color:#ffffff; font-family:sans-serif;">']
     svg.append(f'<text x="{width/2}" y="30" text-anchor="middle" font-size="16" font-weight="bold">Inference Latency vs. Memory Size</text>')
@@ -123,13 +134,13 @@ def generate_svg_latency(lat_data, output_path):
         base_points.append(f"{cx:.1f},{cy_b:.1f}")
         svg.append(f'<text x="{cx}" y="{y0 + 20}" text-anchor="middle" font-size="11">{int(x)}</text>')
 
-    svg.append(f'<polyline points="{" ".join(lsg_points)}" fill="none" stroke="#2b5c8f" stroke-width="3"/>')
-    svg.append(f'<polyline points="{" ".join(base_points)}" fill="none" stroke="#d95f02" stroke-width="3" stroke-dasharray="5,5"/>')
+    svg.append(f'<polyline points="{" ".join(lsg_points)}" fill="none" stroke="{DEFAULT_PALETTE[0]}" stroke-width="3"/>')
+    svg.append(f'<polyline points="{" ".join(base_points)}" fill="none" stroke="{DEFAULT_PALETTE[1]}" stroke-width="3" stroke-dasharray="5,5"/>')
 
     # Legend
-    svg.append(f'<rect x="{x0 + 20}" y="{y1 + 10}" width="12" height="12" fill="#2b5c8f"/>')
+    svg.append(f'<rect x="{x0 + 20}" y="{y1 + 10}" width="12" height="12" fill="{DEFAULT_PALETTE[0]}"/>')
     svg.append(f'<text x="{x0 + 40}" y="{y1 + 20}" font-size="12">LSG O(1)</text>')
-    svg.append(f'<rect x="{x0 + 120}" y="{y1 + 10}" width="12" height="12" fill="#d95f02"/>')
+    svg.append(f'<rect x="{x0 + 120}" y="{y1 + 10}" width="12" height="12" fill="{DEFAULT_PALETTE[1]}"/>')
     svg.append(f'<text x="{x0 + 140}" y="{y1 + 20}" font-size="12">Baseline O(n)</text>')
 
     svg.append('</svg>')
@@ -140,15 +151,22 @@ def plot_all_results(results_dir="results2", assets_dir="assets"):
     os.makedirs(assets_dir, exist_ok=True)
     print(f"Generating visual graph assets from '{results_dir}' into '{assets_dir}'...")
 
-    pr_data = parse_csv(os.path.join(results_dir, "pr_sweep.csv"))
+    pr_csv_path = os.path.join(results_dir, "pr_sweep.csv")
+    pr_data = parse_csv(pr_csv_path)
     if pr_data:
         generate_svg_pr_curve(pr_data, os.path.join(assets_dir, "fig_pr_curve.svg"))
         print(" -> Generated assets/fig_pr_curve.svg")
+    else:
+        print(f"pr_sweep.csv not found in '{results_dir}', skipping PR curve plot")
 
-    lat_data = parse_csv(os.path.join(results_dir, "latency_scaling.csv"))
+    lat_csv_path = os.path.join(results_dir, "latency_scaling.csv")
+    lat_data = parse_csv(lat_csv_path)
     if lat_data:
         generate_svg_latency(lat_data, os.path.join(assets_dir, "fig_latency_scaling.svg"))
         print(" -> Generated assets/fig_latency_scaling.svg")
+    else:
+        print(f"latency_scaling.csv not found in '{results_dir}', skipping latency scaling plot")
 
 if __name__ == "__main__":
     plot_all_results()
+
