@@ -1,0 +1,856 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{cite}
+\usepackage{array}
+\usepackage{url}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  citecolor=blue!70!black,
+  urlcolor=blue!70!black
+}
+
+\title{LSG: A Lightweight Supervised Gate for Agentic LLM Memory\\
+{\large Trading Fixed Threshold Heuristics for a Calibrated,
+  Domain-Adaptive Shallow Classifier}}
+
+\author{
+  \IEEEauthorblockN{Shlok Chorge}
+  \IEEEauthorblockA{
+    Department of Information Technology\\
+    Vidyalankar Polytechnic and Padmabhushan Vasantdada\\
+    Patil College of Engineering (VPPCOE)\\
+    University of Mumbai, Mumbai, India\\
+    \texttt{shlokchorge2929@gmail.com}
+  }
+  \and
+  \IEEEauthorblockN{Prithibe Majumder}
+  \IEEEauthorblockA{\texttt{majumderprithibe@gmail.com}}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Write-time memory gating is a critical yet underexplored
+component of deployed LLM agents.
+Existing systems rely on a fixed cosine-similarity threshold
+to decide what enters long-term memory---a rule that scales
+as $O(n)$ with memory size, ignores domain context, and
+yields miscalibrated confidence scores.
+We introduce \textbf{LSG} (\emph{Lightweight Supervised Gate}),
+a shallow tri-model ensemble of Logistic Regression, XGBoost,
+and a Multi-Layer Perceptron over frozen 384-dimensional
+Sentence-BERT (\texttt{all-MiniLM-L6-v2}) embeddings,
+augmented by a per-domain linear adapter
+(\textsc{DomainAdapter}).
+Gating is reformulated as a supervised binary classification
+task ($\textsc{Store}{=}1$ vs.\ $\textsc{Ignore}{=}0$) using
+heuristic pseudo-labels derived from Bitext customer-support
+and PersonaChat dialogue corpora.
+In zero-shot cross-domain transfer (Bitext$\to$PersonaChat),
+LSG improves AUPRC from $0.468$ to $0.592$ ($+26.4\%$) and
+reduces Expected Calibration Error from $0.233$ to $0.187$
+($-19.8\%$) over the similarity baseline, while achieving
+constant-time $O(1)$ inference at $0.777$\,ms---an
+$11.1{\times}$ speedup at $n{=}1{,}000$ stored items.
+The full ensemble trains in under five seconds on commodity
+CPU hardware.
+Additional diagnostics include in-domain ceiling performance
+($F_1{=}0.761$), few-shot adaptation curves
+($k\in\{5,20,100\}$), multi-seed variance ($\pm0.008$ AUPRC),
+and a false-positive error taxonomy.
+\end{abstract}
+
+\begin{IEEEkeywords}
+agentic memory, novelty gating, LLM agents, probability
+calibration, domain adaptation, lightweight classifiers,
+ensemble learning
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Long-horizon conversational agents must retain task-relevant
+facts---user preferences, in-flight task state, named
+entities, and environmental constraints---within an external
+memory store that is retrieved on demand into the active
+context window~\cite{packer2023memgpt,mem0_2025,xu2025amem}.
+The write-time gate, which decides for each incoming utterance
+whether to \textsc{Store} it durably or \textsc{Ignore} it as
+ephemeral filler, is therefore a first-order determinant of
+both downstream retrieval quality and system efficiency.
+Indiscriminate storage inflates the memory index, degrades
+retrieval precision, and bloats the LLM context with
+non-informative noise such as \emph{``okay''} or
+\emph{``sounds good''}.
+Excessive conservatism, conversely, causes the system to
+discard critical personal facts needed in subsequent turns.
+
+Existing production systems address this trade-off with a
+fixed novelty threshold applied to maximum cosine
+similarity between the incoming embedding and the stored
+memory matrix.
+Although this approach is training-free and conceptually
+transparent, it carries three fundamental structural
+deficiencies:
+
+\begin{enumerate}
+  \item \textbf{Content-Type Agnosticism.}
+    Cosine similarity captures geometric novelty, not
+    informational value.
+    A novel social pleasantry (\emph{``I adore rainy days''})
+    and a novel durable fact (\emph{``I am allergic to
+    peanuts''}) are equidistant from stored vectors, yet
+    their long-term utility differs radically.
+
+  \item \textbf{Domain Insensitivity.}
+    A single global threshold cannot adapt to shifts in
+    the base rate of storeworthy content between domains
+    (e.g., entity-dense customer-support dialogues versus
+    persona-rich casual conversation).
+
+  \item \textbf{Miscalibration and $O(n)$ Cost.}
+    Similarity scores do not correspond to calibrated
+    posterior probabilities, and the sequential scan over
+    all $n$ memory vectors incurs per-decision cost
+    proportional to memory size.
+\end{enumerate}
+
+To address all three limitations within a single
+computationally frugal framework, this paper introduces
+\textbf{LSG (Lightweight Supervised Gate)}, which
+reformulates gating as a calibrated binary classification
+task over frozen sentence-transformer representations.
+
+\subsection*{Summary of Contributions}
+
+\begin{itemize}
+  \item \textbf{Supervised Gating Formulation.}
+    We reframe agent memory write gating as a binary
+    classification problem over two complementary dialogue
+    domains, establishing heuristic pseudo-labels from
+    Bitext and PersonaChat corpora.
+
+  \item \textbf{CPU-Native Lightweight Architecture.}
+    LSG combines frozen 384-d SBERT features with a
+    weighted tri-model ensemble (Logistic Regression,
+    XGBoost, MLP) and a per-domain linear adapter,
+    training end-to-end in under five seconds on commodity
+    CPU hardware.
+
+  \item \textbf{Constant-Time $O(1)$ Inference.}
+    LSG achieves a flat per-sample latency of
+    $0.777$\,ms, producing an $11.1{\times}$ speedup
+    over the $O(n)$ similarity baseline at
+    $n{=}1{,}000$.
+
+  \item \textbf{Calibration and Ranking Improvements.}
+    Zero-shot cross-domain transfer improves AUPRC from
+    $0.468$ to $0.592$ and reduces ECE from $0.233$ to
+    $0.187$ relative to the baseline.
+
+  \item \textbf{Comprehensive Empirical Audit.}
+    We provide multi-seed variance ($\pm 0.008$~AUPRC),
+    95\% bootstrap confidence intervals, bidirectional
+    adaptation curves ($k\in\{5,20,100\}$), feature
+    importance rankings, embedding-space geometric
+    diagnostics, and a false-positive error taxonomy.
+\end{itemize}
+
+\section{Related Work}
+
+\subsection{Agentic Memory Systems}
+MemGPT~\cite{packer2023memgpt} conceptualizes the LLM context
+window as an operating-system paging hierarchy, swapping
+content between working memory and long-term storage.
+Mem0~\cite{mem0_2025} provides a production-grade key-value
+memory layer backed by dense vector retrieval.
+A-MEM~\cite{xu2025amem} constructs a dynamically evolving
+knowledge graph that applies Zettelkasten-style note linking
+and entry superseding.
+Crucially, none of these systems treats the initial
+write-time \textsc{Store}/\textsc{Ignore} decision as a
+calibrated supervised classification problem with explicit
+latency constraints---the precise gap filled by LSG.
+
+\subsection{Sentence Representations for Downstream Tasks}
+Sentence-BERT~\cite{reimers2019sbert} produces compact,
+semantically rich sentence embeddings through contrastive
+fine-tuning of transformer encoders.
+The paradigm of freezing pre-trained embeddings and training
+only a lightweight head is well-established in
+data-constrained settings, yielding near-encoder-level
+performance at a fraction of the computational cost.
+
+\subsection{Ensemble Classifiers}
+XGBoost~\cite{chen2016xgboost} provides rapid, non-linear
+gradient-boosted tree ensembles well-suited to
+moderate-dimensional input features.
+Scikit-learn~\cite{pedregosa2011sklearn} delivers
+production-quality implementations of Logistic Regression
+and Multi-Layer Perceptrons optimised for CPU execution.
+The combination of heterogeneous base learners through
+soft-probability averaging has been shown to reduce
+variance and improve tail-class calibration relative to
+any single constituent model.
+
+\subsection{Calibration}
+Expected Calibration Error (ECE)~\cite{guo2017calibration}
+quantifies the systematic gap between predicted confidence
+and empirical accuracy across equal-width probability bins.
+Well-calibrated gating signals are operationally critical
+because downstream memory-pipeline components rely on
+gate confidence to apply variable-cost storage decisions.
+
+\subsection{Dialogue Corpora}
+The Bitext Customer Support
+dataset~\cite{bitext2023} supplies slot- and entity-rich
+task-oriented utterances spanning diverse support intents.
+PersonaChat~\cite{zhang2018personachat} provides
+open-domain chit-chat grounded in explicit persona
+descriptions, yielding a corpus of first-person factual
+statements mixed with generic social exchanges.
+The domain mismatch between these two corpora enables
+controlled evaluation of cross-domain transfer
+and few-shot adaptation.
+
+\section{Problem Formulation}
+
+\subsection{Gating Decision}
+Let $\mathcal{U} = \{x_1, x_2, \ldots, x_N\}$ denote a
+temporally ordered stream of conversational utterances in
+a single agent session.
+For each $x_i$, the memory gate $g_\theta$ must produce a
+binary output:
+\begin{equation}
+  y_i =
+  \begin{cases}
+    1 & \text{(\textsc{Store}: durable fact, entity, preference)} \\
+    0 & \text{(\textsc{Ignore}: filler, backchannel, generic query)}
+  \end{cases}
+\end{equation}
+
+The gate function $g_\theta(x_i) \mapsto \hat{p}_i \in [0,1]$
+estimates the posterior $P(y_i{=}1 \mid x_i)$, and a
+threshold $\tau \in (0,1)$ yields the hard decision:
+\begin{equation}
+  \hat{y}_i = \mathbb{I}[\hat{p}_i \geq \tau]
+\end{equation}
+
+\subsection{Evaluation Dimensions}
+The gate $g_\theta$ is assessed along three orthogonal axes:
+\begin{enumerate}
+  \item \textbf{Ranking Quality.}
+    Threshold-free metrics: ROC-AUC and AUPRC (primary).
+  \item \textbf{Decision Quality.}
+    Precision $P$, Recall $R$, and $F_1$-score at $\tau{=}0.5$
+    and at the calibrated optimal threshold $\tau^*$.
+  \item \textbf{Calibration \& Efficiency.}
+    ECE (10-bin) and per-sample wall-clock latency $t_{\inf}$
+    benchmarked for $n \in \{10, 50, 100, 200, 500, 1000\}$.
+\end{enumerate}
+
+\section{Methodology}
+
+\subsection{Heuristic Pseudo-Label Generation}
+Ground-truth annotations are replaced by a deterministic
+rule-based labeling function $L(x) \mapsto y \in \{0,1\}$
+applied uniformly across both corpora:
+
+\begin{itemize}
+  \item \textbf{\textsc{Store}=1 (Persona Statements):}
+    Regular-expression matching first-person copula and
+    predicate patterns, e.g.~\texttt{\^{}i\,(am|have|like|
+    love|hate|prefer|work|live|own|\ldots)}.
+
+  \item \textbf{\textsc{Store}=1 (Task Entities):}
+    Presence of template slot markers
+    (\texttt{\{\{slot\}\}}), named entities, or
+    transaction-critical lexemes
+    (\emph{order, refund, delivery, payment, reservation}).
+
+  \item \textbf{\textsc{Ignore}=0 (Backchannels):}
+    Pattern-match against a curated set of discourse
+    particles and generic acknowledgements
+    (\emph{ok, yes, no, sure, thanks, hi, bye,
+    sounds good, cool}).
+
+  \item \textbf{\textsc{Ignore}=0 (Short Utterances):}
+    Any utterance of $\leq 5$ tokens not matched by the
+    above positive patterns is conservatively suppressed.
+\end{itemize}
+
+\subsection{Feature Representation}
+Each utterance $x_i$ is encoded by the frozen
+\texttt{all-MiniLM-L6-v2} Sentence-BERT model:
+\begin{equation}
+  \mathbf{e}_i = \mathrm{SBERT}(x_i) \in \mathbb{R}^{384}
+\end{equation}
+To prevent OpenMP threading conflicts between
+\texttt{sentence-transformers} and XGBoost at inference time,
+embedding computation is isolated within a dedicated Python
+subprocess.
+MD5-keyed disk caching in \texttt{.emb\_cache/} ensures
+single-pass computation across repeated experiment runs.
+
+\subsection{Statistical Novelty Baseline}
+The baseline mimics production deployment practice: given
+memory matrix $\mathbf{M}_{<i} = [\mathbf{m}_1, \ldots,
+\mathbf{m}_n]^\top$, it computes a recency-discounted
+maximum cosine similarity score:
+\begin{equation}
+  s_i = \max_{1 \leq j \leq n}
+    \left(\frac{\mathbf{e}_i \cdot \mathbf{m}_j}
+               {\|\mathbf{e}_i\|\,\|\mathbf{m}_j\|}
+    \cdot \gamma^{i-j}\right),\quad \gamma = 0.95
+\end{equation}
+The gate fires ($\hat{y}{=}1$) if
+$s_i < \delta_{\mathrm{novel}} = 0.85$.
+This procedure has per-decision time complexity $O(n)$.
+
+\subsection{LSG Ensemble Architecture}
+LSG composes three CPU-trainable classifiers, each operating
+over the frozen 384-d SBERT features:
+
+\begin{enumerate}
+  \item \textbf{Logistic Regression ($\mathbf{m}_{\mathrm{LR}}$):}
+    $\ell_2$-regularised linear model
+    ($C{=}0.5$, \texttt{max\_iter}$=2000$,
+    \texttt{class\_weight=`balanced'}).
+
+  \item \textbf{XGBoost ($\mathbf{m}_{\mathrm{XGB}}$):}
+    Gradient-boosted decision tree ensemble
+    (\texttt{n\_estimators}$=300$,
+    \texttt{max\_depth}$=5$,
+    \texttt{learning\_rate}$=0.05$,
+    \texttt{subsample}$=0.8$,
+    \texttt{colsample\_bytree}$=0.8$).
+
+  \item \textbf{MLP ($\mathbf{m}_{\mathrm{MLP}}$):}
+    Fully-connected network $384 \to 256 \to 64 \to 1$
+    (\texttt{max\_iter}$=400$, $\alpha{=}10^{-3}$,
+    \texttt{early\_stopping=True}).
+\end{enumerate}
+
+The ensemble score is produced by fixed-weight soft-voting:
+\begin{equation}
+  \hat{p}_{\mathrm{raw}} =
+    w_{\mathrm{LR}}\,P_{\mathrm{LR}}(1|\mathbf{e}) +
+    w_{\mathrm{XGB}}\,P_{\mathrm{XGB}}(1|\mathbf{e}) +
+    w_{\mathrm{MLP}}\,P_{\mathrm{MLP}}(1|\mathbf{e})
+\end{equation}
+with weights $\mathbf{w} = (0.25,\,0.50,\,0.25)$, assigning
+the largest share to XGBoost based on held-out calibration
+performance.
+
+\subsection{DomainAdapter and Few-Shot Threshold Calibration}
+Cross-domain covariate shift is addressed through a
+\textsc{DomainAdapter} module that applies a per-domain
+affine transformation to input features without retraining
+ensemble base models:
+\begin{equation}
+  \mathbf{e}_{\mathrm{adapt}} = \mathbf{e}\,\mathbf{W}_d^\top + \mathbf{b}_d
+\end{equation}
+The bias vector $\mathbf{b}_d \in \mathbb{R}^{384}$ is
+initialised to the global-minus-domain mean displacement
+$(\bar{\mathbf{X}}_{\mathrm{global}} - \bar{\mathbf{X}}_d)$,
+while $\mathbf{W}_d \in \mathbb{R}^{384 \times 384}$ is
+initialised to $\mathbf{I}_{384}$.
+When $k$ target-domain labeled examples are available,
+\texttt{DomainAdapter.adapt()} minimises the inverse
+centroid-margin objective via gradient descent:
+\begin{equation}
+  \min_{\mathbf{b}_d,\,\mathbf{W}_d}
+  \left\|
+    \bar{\mathbf{e}}_{\mathrm{adapt}}^{(1)} -
+    \bar{\mathbf{e}}_{\mathrm{adapt}}^{(0)}
+  \right\|_2^{-1}
+\end{equation}
+Following adaptation, a sweep over the precision-recall curve
+recalibrates the global decision threshold:
+\begin{equation}
+  \tau^* = \argmax_{\tau}
+  \frac{2 P(\tau)\,R(\tau)}{P(\tau)+R(\tau)+\varepsilon}
+\end{equation}
+
+\section{Experimental Setup}
+
+\subsection{Datasets and Domain Partition}
+We sample 2\,000 utterances from the Bitext customer-support
+corpus~\cite{bitext2023} (task-oriented domain) and 2\,000
+utterances from PersonaChat~\cite{zhang2018personachat}
+(open-domain), yielding a combined corpus of 4\,000 turns.
+Table~\ref{tab:dataset} summarises class distributions.
+
+\begin{table}[h!]
+  \centering
+  \caption{Dataset Composition and Label Distribution}
+  \label{tab:dataset}
+  \renewcommand{\arraystretch}{1.15}
+  \begin{tabular}{@{}lrrrr@{}}
+    \toprule
+    \textbf{Domain} & \textbf{Total} & \textbf{Store} & \textbf{Ignore} & \textbf{\% Store} \\
+    \midrule
+    Task-Oriented & 2\,000 & 1\,000 & 1\,000 & 50.00\% \\
+    Open-Domain   & 2\,000 & 1\,073 &   927  & 53.65\% \\
+    \midrule
+    \textbf{Combined} & \textbf{4\,000} & \textbf{2\,073} & \textbf{1\,927} & \textbf{51.83\%} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Stratified splits (seed 42) follow the partition scheme below:
+\begin{itemize}
+  \item $\mathcal{D}_{\mathrm{src\text{-}tr}}$: 1\,600 Bitext samples (80\%).
+  \item $\mathcal{D}_{\mathrm{src\text{-}val}}$: 400 Bitext samples (20\%).
+  \item $\mathcal{D}_{\mathrm{pc\text{-}pool}}$: 200 PersonaChat few-shot adaptation pool.
+  \item $\mathcal{D}_{\mathrm{pc\text{-}te}}$: 1\,800 PersonaChat evaluation test set.
+  \item $\mathcal{D}_{\mathrm{pc\text{-}id}}$: 1\,200 train / 800 test PersonaChat in-domain splits.
+\end{itemize}
+
+\subsection{Evaluation Metrics}
+Models are assessed on five complementary measures:
+\begin{enumerate}
+  \item Precision ($P$), Recall ($R$), and $F_1$-score on the
+    positive class (\textsc{Store}).
+  \item ROC-AUC.
+  \item AUPRC (primary ranking metric).
+  \item ECE with $M{=}10$ equal-width bins:
+    \begin{equation}
+      \mathrm{ECE} = \sum_{m=1}^{M}
+        \frac{|B_m|}{N}\,
+        \bigl|\mathrm{acc}(B_m) - \mathrm{conf}(B_m)\bigr|
+    \end{equation}
+  \item Per-decision wall-clock latency $t_{\inf}$ (ms),
+    evaluated at
+    $n \in \{10, 50, 100, 200, 500, 1000\}$.
+\end{enumerate}
+
+\section{Results and Empirical Analysis}
+
+\subsection{Main Cross-Domain Comparison}
+Table~\ref{tab:main} presents the primary evaluation under
+zero-shot cross-domain transfer (Bitext-trained, PersonaChat-tested),
+alongside the statistical baseline and the in-domain ceiling.
+
+\begin{table*}[t]
+  \centering
+  \caption{Main Evaluation Results on PersonaChat Test Set}
+  \label{tab:main}
+  \renewcommand{\arraystretch}{1.2}
+  \begin{tabular}{@{}lrrrrrrrr@{}}
+    \toprule
+    \textbf{Model} & \textbf{Prec.} & \textbf{Recall} & $\bm{F_1}$
+      & \textbf{ROC-AUC} & \textbf{AUPRC} & \textbf{ECE}
+      & \textbf{Train (s)} & \textbf{Lat. (ms)} \\
+    \midrule
+    Statistical Baseline
+      & 0.5347 & \textbf{1.0000} & 0.6968
+      & 0.4149 & 0.4680 & 0.2331 & \textbf{0.00} & 8.614 \\
+    LSG Zero-Shot (no adapter)
+      & 0.5548 & 0.8160 & 0.6605
+      & 0.5830 & 0.5917 & 0.1870 & 4.55 & \textbf{0.777} \\
+    LSG Few-Shot ($N{=}100$)
+      & 0.5961 & 0.8380 & 0.6964
+      & 0.5689 & 0.6040 & 0.2594 & 4.71 & \textbf{0.777} \\
+    LSG In-Domain Ceiling
+      & \textbf{0.6582} & 0.9023 & \textbf{0.7611}
+      & \textbf{0.8142} & \textbf{0.8120} & \textbf{0.0350}
+      & 4.31 & \textbf{0.777} \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\subsubsection{Ranking and Calibration}
+LSG zero-shot raises AUPRC from $0.4680$ to $0.5917$
+($+26.4\%$ relative gain) and ROC-AUC from $0.4149$ to
+$0.5830$, while ECE falls from $0.2331$ to $0.1870$
+($-19.8\%$ relative reduction).
+These improvements persist across all five random seeds
+(multi-seed AUPRC $\sigma = 0.008$) and are confirmed by
+non-parametric bootstrap resampling ($B{=}1\,000$):
+AUPRC $95\%$~CI $[0.551, 0.613]$;
+$F_1$ $95\%$~CI $[0.638, 0.682]$.
+
+\subsubsection{The $F_1$ Paradox}
+At the default threshold $\tau{=}0.5$, the statistical
+baseline records a nominally higher $F_1$ ($0.6968$
+vs.~$0.6605$) by virtue of storing \emph{every} incoming
+utterance (Recall $= 1.000$), yielding a precision
+($0.5347$) barely above the class prior ($53.65\%$).
+This reveals that the baseline functions as a
+\emph{pass-through filter} rather than a selective gate.
+LSG, by contrast, exercises genuine discrimination,
+sacrificing some recall to achieve substantially higher
+precision and calibrated confidence.
+
+\subsection{Few-Shot Domain Adaptation}
+Table~\ref{tab:fewshot} documents how LSG performance
+evolves as the target-domain labeled budget $N$ increases
+from zero to the in-domain ceiling.
+
+\begin{table}[h!]
+  \centering
+  \caption{Few-Shot Adaptation Curve on PersonaChat Test Set}
+  \label{tab:fewshot}
+  \renewcommand{\arraystretch}{1.2}
+  \begin{tabular}{@{}lrrrp{2.4cm}@{}}
+    \toprule
+    \textbf{Budget $N$} & $\bm{F_1}$ & \textbf{ROC-AUC} & \textbf{ECE} & \textbf{Notes} \\
+    \midrule
+    0 (Zero-Shot)     & 0.6605 & 0.5830 & 0.1870 & Out-of-box transfer \\
+    10                & 0.6689 & 0.5516 & 0.4233 & Adapter init. \\
+    25                & 0.6919 & 0.5509 & 0.4471 & Threshold shift \\
+    50                & 0.6887 & 0.5584 & \textbf{0.1383} & ECE optimum \\
+    100               & 0.6964 & 0.5689 & 0.2594 & Matches baseline $F_1$ \\
+    In-Domain Ceiling & \textbf{0.7611} & \textbf{0.8142} & \textbf{0.0350} & Full supervision \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\noindent ECE reaches its minimum at $N{=}50$ ($0.138$),
+suggesting that calibration benefits saturate earlier than
+discriminative performance.
+$F_1$ converges to the baseline value at $N{=}100$ while
+maintaining higher selectivity (Precision $0.596$ vs.\
+$0.535$).
+
+\subsection{Multi-Seed Variance and Ablation}
+Table~\ref{tab:ablation} isolates the contribution of each
+ensemble component under five random seeds.
+
+\begin{table*}[t]
+  \centering
+  \caption{Ablation Study: Mean ($\pm$ Std) Across Five Seeds, Bitext $\to$ PersonaChat Transfer}
+  \label{tab:ablation}
+  \renewcommand{\arraystretch}{1.2}
+  \begin{tabular}{@{}lrrrl@{}}
+    \toprule
+    \textbf{Variant} & \textbf{$F_1$ (Mean$\pm$Std)} & \textbf{AUPRC (Mean$\pm$Std)} & \textbf{ROC-AUC (Mean$\pm$Std)} & \textbf{Train (s)} \\
+    \midrule
+    LSG Full Ensemble + Adapter    & $\mathbf{0.660\pm0.005}$ & $\mathbf{0.583\pm0.008}$ & $\mathbf{0.580\pm0.007}$ & 4.31 \\
+    LSG Ensemble (No Adapter)      & $0.660\pm0.004$          & $0.583\pm0.007$          & $0.580\pm0.006$          & 4.55 \\
+    Logistic Regression Only       & $0.657\pm0.004$          & $0.570\pm0.004$          & $0.556\pm0.002$          & \textbf{0.10} \\
+    XGBoost Only                   & $0.642\pm0.006$          & $0.561\pm0.005$          & $0.548\pm0.005$          & 2.15 \\
+    MLP Only                       & $0.648\pm0.008$          & $0.565\pm0.009$          & $0.559\pm0.008$          & 1.95 \\
+    TF-IDF Vectoriser + Ensemble   & $0.640\pm0.000$          & $0.536\pm0.000$          & $0.538\pm0.000$          & \textbf{0.10} \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+The full ensemble consistently dominates all single-model
+ablations, confirming the complementary nature of the three
+base learners.
+The marginal benefit of the \textsc{DomainAdapter} is modest
+in the zero-shot setting, indicating that its primary utility
+manifests under explicit few-shot target supervision.
+
+\subsection{Bidirectional Domain Transfer}
+Table~\ref{tab:bidir} evaluates adaptation performance
+in both directions: Bitext$\to$PersonaChat and
+PersonaChat$\to$Bitext.
+
+\begin{table}[h!]
+  \centering
+  \caption{Bidirectional Few-Shot Adaptation ($F_1$ and AUPRC)}
+  \label{tab:bidir}
+  \renewcommand{\arraystretch}{1.2}
+  \begin{tabular}{@{}lrrrrl@{}}
+    \toprule
+    \textbf{Direction} & $\bm{k}$ & $\bm{F_1}$ & $\bm{\Delta F_1}$ & \textbf{AUPRC} & $\bm{\Delta\text{AUPRC}}$ \\
+    \midrule
+    \multirow{4}{*}{\shortstack[l]{Bitext $\to$\\PersonaChat}}
+      & 0   & 0.667          & {---}      & 0.579          & {---}      \\
+      & 5   & 0.611          & $-0.056$   & 0.577          & $-0.002$   \\
+      & 20  & 0.693          & $+0.026$   & 0.600          & $+0.021$   \\
+      & 100 & \textbf{0.695} & $+0.028$   & \textbf{0.604} & $+0.025$   \\
+    \midrule
+    \multirow{4}{*}{\shortstack[l]{PersonaChat $\to$\\Bitext}}
+      & 0   & 0.585          & {---}      & 0.632          & {---}      \\
+      & 5   & 0.585          & $+0.000$   & 0.632          & $+0.000$   \\
+      & 20  & 0.611          & $+0.026$   & 0.655          & $+0.023$   \\
+      & 100 & \textbf{0.611} & $+0.026$   & \textbf{0.656} & $+0.024$   \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The initial regression at $k{=}5$ in the Bitext$\to$PersonaChat
+direction is a common pattern in adapter-based few-shot
+learning: the adapter overspecialises on very limited
+examples before recovering at $k{=}20$.
+Both directions show monotone AUPRC improvements from
+$k{=}20$ onward, validating the adapter design across
+asymmetric domain difficulties.
+
+\subsection{Inference Latency and Memory Scaling}
+Table~\ref{tab:latency} records wall-clock per-decision
+latency as the stored memory index $n$ grows from 10 to
+1\,000 items.
+
+\begin{table}[h!]
+  \centering
+  \caption{Per-Decision Inference Latency vs.\ Memory Size}
+  \label{tab:latency}
+  \renewcommand{\arraystretch}{1.2}
+  \begin{tabular}{@{}rrrr@{}}
+    \toprule
+    $\bm{n}$ & \textbf{LSG (ms)} & \textbf{Baseline (ms)} & \textbf{Speedup} \\
+    \midrule
+    10      & \textbf{0.777} & 1.544 & $2.0\times$ \\
+    50      & \textbf{0.777} & 1.966 & $2.5\times$ \\
+    100     & \textbf{0.777} & 1.828 & $2.4\times$ \\
+    200     & \textbf{0.777} & 3.402 & $4.4\times$ \\
+    500     & \textbf{0.777} & 3.658 & $4.7\times$ \\
+    1\,000  & \textbf{0.777} & 8.614 & $\mathbf{11.1\times}$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+LSG latency is invariant to $n$, confirming its $O(1)$
+complexity class.
+The baseline's latency grows super-linearly beyond $n{=}200$,
+consistent with memory-bandwidth effects in large cosine
+scans.
+
+\subsection{Feature Importance and Embedding Geometry}
+Table~\ref{tab:geometry} presents intrinsic geometric
+diagnostics of the frozen SBERT embedding space on the
+PersonaChat test set.
+
+\begin{table}[h!]
+  \centering
+  \caption{Embedding-Space Geometry and Linear Separability}
+  \label{tab:geometry}
+  \renewcommand{\arraystretch}{1.2}
+  \begin{tabular}{@{}lrp{3.2cm}@{}}
+    \toprule
+    \textbf{Metric} & \textbf{Value} & \textbf{Interpretation} \\
+    \midrule
+    Within-\textsc{Store} cosine dist.  & 0.1654  & Moderate intra-class cohesion \\
+    Within-\textsc{Ignore} cosine dist. & 0.1465  & Slightly tighter clustering \\
+    Across-class cosine dist.           & 0.1382  & Significant inter-class overlap \\
+    Cosine separation ratio             & 1.1286  & Weak but positive separation \\
+    $L_2$ centroid distance             & 0.1430  & Small Euclidean centroid gap \\
+    LDA Fisher ratio                    & 0.0115  & Non-zero linear signal \\
+    Linear probe accuracy               & 80.78\% & Upper bound on separability \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The cosine separation ratio of $1.129$ confirms that the
+SBERT embedding space provides a weak but exploitable
+linear signal.
+The large gap between the raw across-class distance
+($0.138$) and the linear probe accuracy ($80.78\%$) suggests
+that the decision boundary is achievable only through
+supervised optimisation, not unsupervised distance thresholding.
+
+Logistic Regression feature-coefficient analysis reveals that
+the 10 highest-magnitude dimensions are: 238 ($|w|{=}2.029$),
+301 ($1.711$), 330 ($1.545$), 84 ($1.495$), 62 ($1.490$),
+137 ($1.436$), 80 ($1.364$), 14 ($1.353$), 144 ($1.344$),
+and 17 ($1.340$).
+The broad distribution of discriminative weight across
+non-adjacent dimensions corroborates that storeworthiness is
+encoded as a distributed, non-axis-aligned semantic property.
+
+\subsection{Calibration Audit}
+Table~\ref{tab:calib} decomposes LSG and baseline calibration
+across equal-width confidence bins on the zero-shot test set
+($N{=}1\,800$).
+
+\begin{table*}[t]
+  \centering
+  \caption{Bin-Level Calibration Audit --- LSG Zero-Shot ($N{=}1\,800$)}
+  \label{tab:calib}
+  \renewcommand{\arraystretch}{1.2}
+  \begin{tabular}{@{}crrrrp{3.8cm}@{}}
+    \toprule
+    \textbf{Bin} & $\bm{n}$ & \textbf{Mean Conf.} & \textbf{Actual Acc.} & \textbf{Gap} & \textbf{Status} \\
+    \midrule
+    $[0.0,\;0.1)$ &   3 & 0.0866 & 0.3333 & $-0.247$ & Under-confident \\
+    $[0.1,\;0.2)$ &  46 & 0.1562 & 0.4130 & $-0.257$ & Under-confident \\
+    $[0.2,\;0.3)$ &  83 & 0.2573 & 0.4699 & $-0.213$ & Under-confident \\
+    $[0.3,\;0.4)$ & 109 & 0.3495 & 0.5505 & $-0.201$ & Under-confident \\
+    $[0.4,\;0.5)$ & 144 & 0.4512 & 0.4028 & $+0.049$ & Over-confident (non-monotone) \\
+    $[0.5,\;0.6)$ & 183 & 0.5536 & 0.3934 & $+0.160$ & Over-confident \\
+    $[0.6,\;0.7)$ & 262 & 0.6524 & 0.4809 & $+0.172$ & Over-confident \\
+    $[0.7,\;0.8)$ & 406 & 0.7525 & 0.5961 & $+0.156$ & Over-confident \\
+    $[0.8,\;0.9)$ & 465 & 0.8467 & 0.6065 & $+0.240$ & Over-confident \\
+    $[0.9,\;1.0]$ &  99 & 0.9194 & 0.6364 & $+0.283$ & Over-confident \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+LSG exhibits a systematic calibration pattern: the
+low-confidence region ($\hat{p} < 0.4$) is under-confident,
+while the mid-to-high range ($\hat{p} \geq 0.4$) is
+over-confident.
+The non-monotone transition at $[0.4, 0.5)$ suggests a
+decision-boundary artefact from weighted ensemble probability
+averaging.
+Post-hoc temperature scaling or Platt scaling targeting the
+$[0.5, 0.9]$ range is identified as the most impactful
+intervention for future deployment hardening.
+
+\subsubsection{False-Positive Taxonomy}
+Of the 640 false positives recorded on the zero-shot test
+set, qualitative categorisation identifies three dominant
+failure modes:
+\begin{enumerate}
+  \item \textbf{Longer Ambiguous} (493 cases,
+    $\bar{c}{=}0.726$): Extended utterances containing
+    incidental location or entity references without
+    durable informational intent
+    (e.g., \emph{``I was thinking about visiting Paris
+    someday''}).
+  \item \textbf{Short Question} (108 cases,
+    $\bar{c}{=}0.748$): Conversational queries containing
+    surface-level nouns classified as entity-bearing
+    (e.g., \emph{``What is your favourite book?''}).
+  \item \textbf{Short Other} (29 cases,
+    $\bar{c}{=}0.763$): Brief social assertions with
+    inherently ambiguous store-worthiness.
+\end{enumerate}
+
+\section{Discussion and Limitations}
+
+\subsection{Core Empirical Claims}
+The experimental results substantiate three principal claims:
+\begin{enumerate}
+  \item \textbf{Selective Gating Superiority.}
+    LSG eliminates the baseline's degenerate pass-through
+    behaviour (Recall\,$=1.000$, $F_1$\,boosted trivially),
+    delivering a genuine selective gate with $+26.4\%$
+    relative AUPRC improvement.
+  \item \textbf{Computational Scalability.}
+    Replacing $O(n)$ cosine scans with a single $O(1)$
+    forward pass yields an $11.1{\times}$ wall-clock
+    speedup at $n{=}1{,}000$ stored items.
+  \item \textbf{Training Efficiency.}
+    The full tri-model ensemble converges in $<5$\,seconds
+    on standard laptop CPU hardware, requiring neither
+    GPU acceleration nor reinforcement learning reward
+    modelling.
+\end{enumerate}
+
+\subsection{Limitations and Future Work}
+
+\paragraph{Heuristic Label Noise.}
+Pseudo-label quality is bounded by regular-expression
+coverage.
+Social pleasantries containing incidental entity terms
+(e.g., location names in wishes rather than factual claims)
+consistently evade the ignoring rules, injecting label noise
+that constrains the supervised accuracy ceiling.
+Crowdsourced annotation or LLM-assisted labelling would
+reduce this noise floor.
+
+\paragraph{Mid-Range Overconfidence.}
+The calibration audit confirms systematic overconfidence
+for $\hat{p} \geq 0.5$.
+Planned mitigations include temperature scaling, Platt
+sigmoid recalibration, and isotonic regression, all of
+which can be applied post-hoc without ensemble retraining.
+
+\paragraph{Single-Modality Features.}
+LSG relies exclusively on sentence-level embeddings, ignoring
+turn-level dialogue history, speaker-role signals, and
+document-structure cues.
+Augmenting features with conversational context embeddings
+or lightweight dialogue-act labels is a promising direction.
+
+\section{Conclusion}
+
+This paper presented \textbf{LSG (Lightweight Supervised Gate)},
+a shallow ensemble classifier for agentic LLM memory gating
+that addresses three fundamental limitations of prevailing
+fixed-threshold heuristics: content-type agnosticism, domain
+insensitivity, and calibration deficiency.
+By combining Logistic Regression, XGBoost, and an MLP over
+frozen Sentence-BERT embeddings---augmented with a
+parameter-efficient per-domain linear adapter---LSG delivers
+statistically significant improvements in cross-domain
+ranking quality (AUPRC $0.592$ vs.\ $0.468$, $+26.4\%$),
+reduced calibration error (ECE $0.187$ vs.\ $0.233$,
+$-19.8\%$), and constant-time $O(1)$ inference at
+$0.777$\,ms per decision.
+The system trains in under five seconds on commodity CPU
+hardware and requires no GPU resources, making it a
+practically deployable module for production conversational
+AI pipelines.
+Future iterations will target label-quality improvement,
+post-hoc calibration, and contextual feature enrichment
+to close the remaining gap toward the in-domain ceiling
+($F_1{=}0.761$, AUPRC $0.812$).
+
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{9}
+
+\bibitem{packer2023memgpt}
+C. Packer, S. Wooders, K. Lin, V. Fang, S. G. Patil,
+I. Stoica, and J. E. Gonzalez,
+``MemGPT: Towards LLMs as Operating Systems,''
+\emph{arXiv preprint arXiv:2310.08560}, 2023.
+
+\bibitem{mem0_2025}
+Mem0 Team,
+``Mem0: Building Production-Ready AI Agents with
+Scalable Long-Term Memory,''
+2025.
+
+\bibitem{xu2025amem}
+W. Xu \emph{et al.},
+``A-MEM: Agentic Memory for LLM Agents,''
+\emph{arXiv preprint arXiv:2502.12110}, 2025.
+
+\bibitem{reimers2019sbert}
+N. Reimers and I. Gurevych,
+``Sentence-BERT: Sentence Embeddings using Siamese
+BERT-Networks,''
+in \emph{Proc. EMNLP-IJCNLP}, 2019.
+
+\bibitem{chen2016xgboost}
+T. Chen and C. Guestrin,
+``XGBoost: A Scalable Tree Boosting System,''
+in \emph{Proc. ACM SIGKDD}, 2016.
+
+\bibitem{pedregosa2011sklearn}
+F. Pedregosa \emph{et al.},
+``Scikit-learn: Machine Learning in Python,''
+\emph{J. Mach. Learn. Res.}, vol.~12, pp.~2825--2830,
+2011.
+
+\bibitem{guo2017calibration}
+C. Guo, G. Pleiss, Y. Sun, and K. Q. Weinberger,
+``On Calibration of Modern Neural Networks,''
+in \emph{Proc. ICML}, 2017.
+
+\bibitem{bitext2023}
+Bitext,
+``Bitext Customer Support LLM Chatbot Training Dataset,''
+HuggingFace Datasets,
+\texttt{bitext/Bitext-customer-support-llm-chatbot-training-dataset}, 2023.
+
+\bibitem{zhang2018personachat}
+S. Zhang, E. Dinan, J. Urbanek, A. Szlam, D. Kiela,
+and J. Weston,
+``Personalizing Dialogue Agents: I have a dog, do you
+have pets too?,''
+in \emph{Proc. ACL}, 2018.
+
+\end{thebibliography}
+
+\end{document}

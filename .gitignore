@@ -14,3 +14,15 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# LaTeX / TeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
